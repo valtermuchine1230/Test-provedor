@@ -41,18 +41,31 @@ def get_rrset(subname, rtype):
 
 
 def put_rrset(subname, rtype, records, ttl=3600):
+    """
+    Upsert de um RRset: tenta atualizar (PUT) o RRset existente;
+    se ele ainda não existir (404), cria via POST no endpoint de coleção.
+    """
     url_subname = "@" if subname == "" else subname
-    payload = {
-        "subname": subname,
-        "type": rtype,
-        "ttl": ttl,
-        "records": records,
-    }
-    r = requests.put(
-        f"{API}/domains/{DOMAIN}/rrsets/{url_subname}/{rtype}/",
-        headers=HEADERS,
-        json=payload,
-    )
+    exists = get_rrset(subname, rtype) is not None
+
+    if exists:
+        r = requests.put(
+            f"{API}/domains/{DOMAIN}/rrsets/{url_subname}/{rtype}/",
+            headers=HEADERS,
+            json={"records": records, "ttl": ttl},
+        )
+    else:
+        r = requests.post(
+            f"{API}/domains/{DOMAIN}/rrsets/",
+            headers=HEADERS,
+            json={
+                "subname": subname,
+                "type": rtype,
+                "ttl": ttl,
+                "records": records,
+            },
+        )
+
     if r.status_code not in (200, 201):
         print(
             f"[ERRO] {rtype} {subname or '@'}: "
