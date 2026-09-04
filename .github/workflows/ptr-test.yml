@@ -37,9 +37,46 @@ jobs:
           ROUTE64_IPV6_PREFIX: "2a11:6c7:f35:e3::/64"
         run: python dns_setup.py
 
-      - name: Instalar WireGuard
+      - name: Diagnóstico bruto de UDP (antes do WireGuard)
+        env:
+          WG_ENDPOINT: ${{ secrets.WG_ENDPOINT }}
         run: |
           sudo apt-get update -qq
+          sudo apt-get install -y netcat-openbsd tcpdump
+
+          ENDPOINT_HOST=$(echo "$WG_ENDPOINT" | cut -d: -f1)
+          ENDPOINT_PORT=$(echo "$WG_ENDPOINT" | cut -d: -f2)
+
+          echo "### Capturando tráfego UDP de/para ${ENDPOINT_HOST}:${ENDPOINT_PORT} ###"
+          sudo timeout 10 tcpdump -ni any udp and host "$ENDPOINT_HOST" -w /tmp/udp_raw.pcap &
+          TCPDUMP_PID=$!
+          sleep 1
+
+          echo "Enviando 3 pacotes UDP de teste..."
+          for i in 1 2 3; do
+            echo "probe-$i" | timeout 3 nc -u -w2 "$ENDPOINT_HOST" "$ENDPOINT_PORT" || true
+            sleep 1
+          done
+
+          wait $TCPDUMP_PID 2>/dev/null || true
+
+          echo ""
+          echo "### Pacotes capturados (saída E entrada) ###"
+          sudo tcpdump -nr /tmp/udp_raw.pcap 2>/dev/null || echo "Nenhum pacote capturado."
+
+          SENT=$(sudo tcpdump -nr /tmp/udp_raw.pcap 2>/dev/null | grep -c "> ${ENDPOINT_HOST}" || true)
+          RECV=$(sudo tcpdump -nr /tmp/udp_raw.pcap 2>/dev/null | grep -c "${ENDPOINT_HOST}.* >" || true)
+          echo ""
+          echo "Pacotes de SAÍDA vistos: ${SENT}"
+          echo "Pacotes de ENTRADA vistos: ${RECV}"
+          if [ "$RECV" = "0" ]; then
+            echo "::warning::Nenhum pacote de retorno visto na camada de rede — bloqueio provavelmente antes do WireGuard (rede do runner/Azure), não é problema de config."
+          else
+            echo "::notice::Pacotes de retorno chegaram na rede — se o WireGuard ainda assim não fizer handshake, o problema está na camada do protocolo (formato/chave), não na rede."
+          fi
+
+      - name: Instalar WireGuard
+        run: |
           sudo apt-get install -y wireguard-tools
 
       - name: Subir túnel WireGuard (Route64)
@@ -95,7 +132,7 @@ jobs:
             HANDSHAKE_FINAL=$(sudo wg show wg0 latest-handshakes | awk '{print $2}')
             echo "::error::Túnel WireGuard não está passando tráfego (ping falhou em 5 tentativas)."
             if [ -z "$HANDSHAKE_FINAL" ] || [ "$HANDSHAKE_FINAL" == "0" ]; then
-              echo "::error::Nenhum handshake foi registrado. Causas prováveis: chave pública/privada incorreta, WG_ENDPOINT inacessível/porta UDP bloqueada, ou peer offline."
+              echo "::error::Nenhum handshake foi registrado. Veja o passo de diagnóstico UDP acima para saber se é bloqueio de rede ou de protocolo."
             else
               echo "::error::Handshake existe, mas não há resposta ao ping. Verifique se o peer aceita ICMP no endereço testado ou se há firewall bloqueando."
             fi
