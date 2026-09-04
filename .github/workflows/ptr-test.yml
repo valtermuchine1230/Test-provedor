@@ -7,6 +7,10 @@ on:
         description: "Configurar SPF/DKIM/DMARC no deSEC antes do teste"
         type: boolean
         default: false
+      allow_ipv4_fallback:
+        description: "Continuar o teste mesmo se o túnel IPv6 falhar (não recomendado)"
+        type: boolean
+        default: false
 
 jobs:
   ptr-test:
@@ -59,10 +63,57 @@ jobs:
           EOF
           sudo chmod 600 /etc/wireguard/wg0.conf
           sudo wg-quick up wg0
-          sleep 3
-          ping6 -c 3 2a11:6c7:f35:e3::1 || echo "AVISO: ping falhou, mas seguindo"
 
-      - name: Rodar teste SMTP nos 370+ domínios
+          echo "### Aguardando handshake (até 15s) ###"
+          for i in $(seq 1 5); do
+            sleep 3
+            HANDSHAKE=$(sudo wg show wg0 latest-handshakes | awk '{print $2}')
+            if [ -n "$HANDSHAKE" ] && [ "$HANDSHAKE" != "0" ]; then
+              echo "Handshake confirmado (epoch $HANDSHAKE) após ${i}x3s."
+              break
+            fi
+            echo "Tentativa $i/5: ainda sem handshake..."
+          done
+
+          echo "### wg show (diagnóstico completo) ###"
+          sudo wg show wg0
+
+          echo "### Testando conectividade real via túnel ###"
+          PING_OK=0
+          for i in 1 2 3 4 5; do
+            if ping6 -c 2 -W 3 2a11:6c7:f35:e3::1 > /tmp/ping_out.txt 2>&1; then
+              PING_OK=1
+              echo "Ping OK na tentativa $i."
+              break
+            fi
+            echo "Tentativa $i/5 de ping falhou, tentando de novo em 3s..."
+            sleep 3
+          done
+          cat /tmp/ping_out.txt
+
+          if [ "$PING_OK" != "1" ]; then
+            HANDSHAKE_FINAL=$(sudo wg show wg0 latest-handshakes | awk '{print $2}')
+            echo "::error::Túnel WireGuard não está passando tráfego (ping falhou em 5 tentativas)."
+            if [ -z "$HANDSHAKE_FINAL" ] || [ "$HANDSHAKE_FINAL" == "0" ]; then
+              echo "::error::Nenhum handshake foi registrado. Causas prováveis: chave pública/privada incorreta, WG_ENDPOINT inacessível/porta UDP bloqueada, ou peer offline."
+            else
+              echo "::error::Handshake existe, mas não há resposta ao ping. Verifique se o peer aceita ICMP no endereço testado ou se há firewall bloqueando."
+            fi
+            echo "IPV6_TUNNEL_OK=false" >> "$GITHUB_ENV"
+          else
+            echo "IPV6_TUNNEL_OK=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Abortar se túnel IPv6 falhou (a menos que fallback seja permitido)
+        if: ${{ env.IPV6_TUNNEL_OK != 'true' && !inputs.allow_ipv4_fallback }}
+        run: |
+          echo "::error::Parando o job: túnel IPv6/Route64 não subiu e allow_ipv4_fallback está desativado."
+          echo "Rode de novo com 'allow_ipv4_fallback: true' se quiser mesmo assim testar só por IPv4."
+          exit 1
+
+      - name: Rodar teste SMTP nos domínios
+        env:
+          TEST_LANE: ${{ env.IPV6_TUNNEL_OK == 'true' && 'route64' || 'ipv4-fallback' }}
         run: python smtp_probe.py
 
       - name: Derrubar túnel
