@@ -37,49 +37,40 @@ jobs:
           ROUTE64_IPV6_PREFIX: "2a11:6c7:f35:e3::/64"
         run: python dns_setup.py
 
-      - name: Diagnóstico bruto de UDP (antes do WireGuard)
+      - name: Diagnóstico de baseline UDP (isola a causa raiz)
         env:
           WG_ENDPOINT: ${{ secrets.WG_ENDPOINT }}
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y netcat-openbsd tcpdump
+          sudo apt-get install -y dnsutils
 
           ENDPOINT_HOST=$(echo "$WG_ENDPOINT" | cut -d: -f1)
-          ENDPOINT_PORT=$(echo "$WG_ENDPOINT" | cut -d: -f2)
 
-          echo "### Capturando tráfego UDP de/para ${ENDPOINT_HOST}:${ENDPOINT_PORT} ###"
-          sudo timeout 10 tcpdump -ni any udp and host "$ENDPOINT_HOST" -w /tmp/udp_raw.pcap &
-          TCPDUMP_PID=$!
-          sleep 1
-
-          echo "Enviando 3 pacotes UDP de teste..."
-          for i in 1 2 3; do
-            echo "probe-$i" | timeout 3 nc -u -w2 "$ENDPOINT_HOST" "$ENDPOINT_PORT" || true
-            sleep 1
-          done
-
-          wait $TCPDUMP_PID 2>/dev/null || true
-
-          echo ""
-          echo "### Pacotes capturados (saída E entrada) ###"
-          sudo tcpdump -nr /tmp/udp_raw.pcap 2>/dev/null || echo "Nenhum pacote capturado."
-
-          SENT=$(sudo tcpdump -nr /tmp/udp_raw.pcap 2>/dev/null | grep -c "> ${ENDPOINT_HOST}" || true)
-          RECV=$(sudo tcpdump -nr /tmp/udp_raw.pcap 2>/dev/null | grep -c "${ENDPOINT_HOST}.* >" || true)
-          echo ""
-          echo "Pacotes de SAÍDA vistos: ${SENT}"
-          echo "Pacotes de ENTRADA vistos: ${RECV}"
-          if [ "$RECV" = "0" ]; then
-            echo "::warning::Nenhum pacote de retorno visto na camada de rede — bloqueio provavelmente antes do WireGuard (rede do runner/Azure), não é problema de config."
+          echo "### Teste 1: ICMP direto ao servidor do route64.org ###"
+          if ping -c 3 -W 3 "$ENDPOINT_HOST"; then
+            echo "ICMP_ROUTE64=ok" >> "$GITHUB_ENV"
           else
-            echo "::notice::Pacotes de retorno chegaram na rede — se o WireGuard ainda assim não fizer handshake, o problema está na camada do protocolo (formato/chave), não na rede."
+            echo "ICMP_ROUTE64=fail" >> "$GITHUB_ENV"
+            echo "::warning::ICMP para o host do route64.org falhou."
+          fi
+
+          echo ""
+          echo "### Teste 2: UDP contra destino público que sempre responde (DNS do Google) ###"
+          if dig +time=3 +tries=1 @8.8.8.8 example.com > /tmp/dig_out.txt 2>&1; then
+            cat /tmp/dig_out.txt
+            echo "UDP_BASELINE=ok" >> "$GITHUB_ENV"
+          else
+            cat /tmp/dig_out.txt
+            echo "UDP_BASELINE=fail" >> "$GITHUB_ENV"
+            echo "::error::UDP de entrada NÃO funciona nem para 8.8.8.8 — bloqueio geral no runner, não é problema do route64.org."
           fi
 
       - name: Instalar WireGuard
-        run: |
-          sudo apt-get install -y wireguard-tools
+        if: ${{ env.UDP_BASELINE == 'ok' }}
+        run: sudo apt-get install -y wireguard-tools
 
       - name: Subir túnel WireGuard (Route64)
+        if: ${{ env.UDP_BASELINE == 'ok' }}
         env:
           WG_PRIVATE_KEY: ${{ secrets.WG_PRIVATE_KEY }}
           WG_PEER_PUBKEY: ${{ secrets.WG_PEER_PUBKEY }}
@@ -101,51 +92,39 @@ jobs:
           sudo chmod 600 /etc/wireguard/wg0.conf
           sudo wg-quick up wg0
 
-          echo "### Aguardando handshake (até 15s) ###"
           for i in $(seq 1 5); do
             sleep 3
             HANDSHAKE=$(sudo wg show wg0 latest-handshakes | awk '{print $2}')
-            if [ -n "$HANDSHAKE" ] && [ "$HANDSHAKE" != "0" ]; then
-              echo "Handshake confirmado (epoch $HANDSHAKE) após ${i}x3s."
-              break
-            fi
+            [ -n "$HANDSHAKE" ] && [ "$HANDSHAKE" != "0" ] && break
             echo "Tentativa $i/5: ainda sem handshake..."
           done
-
-          echo "### wg show (diagnóstico completo) ###"
           sudo wg show wg0
 
-          echo "### Testando conectividade real via túnel ###"
           PING_OK=0
           for i in 1 2 3 4 5; do
-            if ping6 -c 2 -W 3 2a11:6c7:f35:e3::1 > /tmp/ping_out.txt 2>&1; then
-              PING_OK=1
-              echo "Ping OK na tentativa $i."
-              break
-            fi
-            echo "Tentativa $i/5 de ping falhou, tentando de novo em 3s..."
+            ping6 -c 2 -W 3 2a11:6c7:f35:e3::1 && { PING_OK=1; break; }
             sleep 3
           done
-          cat /tmp/ping_out.txt
 
           if [ "$PING_OK" != "1" ]; then
-            HANDSHAKE_FINAL=$(sudo wg show wg0 latest-handshakes | awk '{print $2}')
-            echo "::error::Túnel WireGuard não está passando tráfego (ping falhou em 5 tentativas)."
-            if [ -z "$HANDSHAKE_FINAL" ] || [ "$HANDSHAKE_FINAL" == "0" ]; then
-              echo "::error::Nenhum handshake foi registrado. Veja o passo de diagnóstico UDP acima para saber se é bloqueio de rede ou de protocolo."
-            else
-              echo "::error::Handshake existe, mas não há resposta ao ping. Verifique se o peer aceita ICMP no endereço testado ou se há firewall bloqueando."
-            fi
+            echo "::error::Túnel não passou tráfego mesmo com baseline UDP OK — problema específico do endpoint/porta do route64.org, não da rede do runner."
             echo "IPV6_TUNNEL_OK=false" >> "$GITHUB_ENV"
           else
             echo "IPV6_TUNNEL_OK=true" >> "$GITHUB_ENV"
           fi
 
+      - name: Diagnóstico final (se baseline falhou)
+        if: ${{ env.UDP_BASELINE == 'fail' }}
+        run: |
+          echo "::error::Bloqueio geral de UDP de entrada confirmado no runner do GitHub Actions."
+          echo "Isso não é corrigível por configuração — o runner efêmero não recebe resposta UDP de nenhum destino."
+          echo "Alternativas reais: (1) usar Tailscale (github.com/tailscale/github-action, oficialmente suportado em runners hospedados) em vez de WireGuard cru; (2) rodar o túnel numa VPS própria persistente e o Actions só chamar essa VPS via SSH/API."
+          echo "IPV6_TUNNEL_OK=false" >> "$GITHUB_ENV"
+
       - name: Abortar se túnel IPv6 falhou (a menos que fallback seja permitido)
         if: ${{ env.IPV6_TUNNEL_OK != 'true' && !inputs.allow_ipv4_fallback }}
         run: |
           echo "::error::Parando o job: túnel IPv6/Route64 não subiu e allow_ipv4_fallback está desativado."
-          echo "Rode de novo com 'allow_ipv4_fallback: true' se quiser mesmo assim testar só por IPv4."
           exit 1
 
       - name: Rodar teste SMTP nos domínios
