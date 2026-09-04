@@ -1,14 +1,16 @@
 """
-SMTP Diagnostic Engine — v2
+SMTP Diagnostic Engine — v3 (corrigido)
 
-Para cada domínio: resolve MX, detecta o próprio IP de saída (e seu PTR/
-FCrDNS), conecta ao MX, percorre o handshake completo (banner -> EHLO ->
-STARTTLS -> EHLO -> MAIL FROM -> RCPT TO), guarda o transcript inteiro e
-classifica cada resposta por evidência textual, não só pelo código SMTP.
+Corrige o bug crítico da v2: a detecção de IP de saída e a conexão ao MX
+não forçavam de verdade a família IPv6, então quando o túnel Route64 não
+estava roteando, o script caía silenciosamente para IPv4 e reportava isso
+como se fosse IPv6 (ipv4 == ipv6 no relatório anterior). Agora:
+  - a descoberta de IP usa socket+TLS manual, forçando a família pedida;
+  - existe uma checagem explícita de roteabilidade IPv6 antes de tudo;
+  - a conexão ao MX tenta endereços reais (não só DNS) e registra qual
+    família de fato conectou.
 
-Nunca envia DATA. Nunca usa caixas de terceiros. Serve só para descobrir
-COMO cada provedor reage à combinação (nosso domínio, nosso IP/PTR, nosso
-envelope) — não para entregar nada.
+Nunca envia DATA. Nunca usa caixas de terceiros.
 """
 import csv
 import json
@@ -22,7 +24,6 @@ from datetime import datetime, timezone
 
 import dns.resolver
 import dns.reversename
-import requests
 
 from providers import PROVIDERS, PRIORITY
 
@@ -34,9 +35,13 @@ TIMEOUT = 12
 MAX_WORKERS = 20
 SMTP_PORT = 25
 
+# Host IPv6 estável e conhecido, usado só para confirmar que existe rota
+# IPv6 utilizável (ex: através do túnel Route64) antes de testar qualquer MX.
+ROUTE64_CHECK_HOST = os.environ.get("ROUTE64_CHECK_HOST", "2001:4860:4860::8888")
+ROUTE64_CHECK_PORT = 53  # DNS do Google — quase sempre aceita conexão TCP
+
 # ---------------------------------------------------------------------------
-# Classificador de evidências: cada entrada é (regex, classificação,
-# confiança 0-1). A ordem importa — a primeira que bater vence.
+# Classificador de evidências (igual à v2 — não é aqui que estava o bug)
 # ---------------------------------------------------------------------------
 EVIDENCE_RULES = [
     (r"reverse\s*dns|rdns|ptr record|cannot find your hostname|"
@@ -72,12 +77,11 @@ EVIDENCE_RULES = [
 
     (r"user unknown|no such user|mailbox (not found|unavailable)|"
      r"recipient (address )?rejected|does not exist",
-     "RECIPIENT_UNKNOWN_EXPECTED", 0.5),  # esperado, já que o RCPT é fictício
+     "RECIPIENT_UNKNOWN_EXPECTED", 0.5),
 ]
 
 
 def classify_text(text):
-    """Procura evidência textual na resposta SMTP. Retorna (classe, confiança, trecho)."""
     lowered = text.lower()
     for pattern, label, confidence in EVIDENCE_RULES:
         m = re.search(pattern, lowered)
@@ -88,19 +92,72 @@ def classify_text(text):
 
 
 # ---------------------------------------------------------------------------
-# Descoberta do IP de saída + PTR + FCrDNS (feito uma vez por execução,
-# não por domínio — é o mesmo IP de saída para todos os testes desta run)
+# CORREÇÃO 1: descoberta de IP de saída forçando de verdade a família
 # ---------------------------------------------------------------------------
+def http_get_forced_family(host, path, family, port=443, timeout=8):
+    """Faz um GET HTTPS manual, forçando a família de socket (AF_INET ou
+    AF_INET6) de verdade. Ao contrário de `requests`, NÃO faz fallback
+    automático entre famílias — se a conexão na família pedida falhar,
+    a exceção sobe (é isso que faltava na v2)."""
+    infos = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
+    last_exc = None
+    for fam, socktype, proto, canonname, sockaddr in infos:
+        raw = None
+        try:
+            raw = socket.socket(fam, socktype, proto)
+            raw.settimeout(timeout)
+            raw.connect(sockaddr)
+            ctx = ssl.create_default_context()
+            tls = ctx.wrap_socket(raw, server_hostname=host)
+            request = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"User-Agent: smtp-diagnostic-engine/3\r\n"
+                f"Connection: close\r\n\r\n"
+            )
+            tls.sendall(request.encode())
+            data = b""
+            tls.settimeout(timeout)
+            while True:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            tls.close()
+            body = data.split(b"\r\n\r\n", 1)[-1]
+            return body.decode(errors="replace")
+        except Exception as e:
+            last_exc = e
+            if raw is not None:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+            continue
+    raise last_exc or Exception("nenhum endereço resolvido")
+
+
 def discover_source_ip(family):
-    """Descobre o IP público de saída via serviço externo (ipify)."""
-    url = "https://api64.ipify.org?format=json" if family == socket.AF_INET6 \
-        else "https://api.ipify.org?format=json"
+    """Descobre o IP público de saída, forçando a família pedida de verdade.
+    Retorna None (não um IP da família errada) se a família não for
+    roteável — esse é o fix do bug onde ipv4 e ipv6 saíam iguais."""
+    fam_name = "ipv6" if family == socket.AF_INET6 else "ipv4"
+    host = "api64.ipify.org" if family == socket.AF_INET6 else "api.ipify.org"
     try:
-        r = requests.get(url, timeout=8)
-        r.raise_for_status()
-        return r.json().get("ip")
+        body = http_get_forced_family(host, "/?format=json", family)
+        data = json.loads(body)
+        ip = data.get("ip")
+        # proteção extra: se por algum motivo vier um IP da família errada,
+        # trata como falha em vez de aceitar silenciosamente
+        is_v6_format = ip and ":" in ip
+        if family == socket.AF_INET6 and not is_v6_format:
+            raise Exception(f"esperava IPv6 mas recebi '{ip}' — família não foi respeitada")
+        if family == socket.AF_INET and is_v6_format:
+            raise Exception(f"esperava IPv4 mas recebi '{ip}'")
+        return ip
     except Exception as e:
-        print(f"[AVISO] Não consegui detectar IP de saída ({family}): {e}", file=sys.stderr)
+        print(f"[AVISO] Falha ao descobrir IP {fam_name} de saída (rota indisponível?): {e}",
+              file=sys.stderr)
         return None
 
 
@@ -116,7 +173,6 @@ def ptr_lookup(ip):
 
 
 def fcrdns_check(ip, ptr_hostname):
-    """Confirma se o PTR resolve de volta para o mesmo IP (forward-confirmed rDNS)."""
     if not ip or not ptr_hostname:
         return False
     rtype = "AAAA" if ":" in ip else "A"
@@ -128,23 +184,47 @@ def fcrdns_check(ip, ptr_hostname):
 
 
 def asn_org_lookup(ip):
-    """Best-effort: dono/ASN do IP. Não bloqueia o teste se falhar/limitar."""
+    """Best-effort via socket puro (evita depender de requests aqui também)."""
     if not ip:
         return None
     try:
-        r = requests.get(f"https://ipapi.co/{ip}/json/", timeout=6)
-        if r.status_code == 200:
-            data = r.json()
-            return {"asn": data.get("asn"), "org": data.get("org"),
-                    "country": data.get("country_name")}
+        family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+        body = http_get_forced_family("ipapi.co", f"/{ip}/json/", family, timeout=6)
+        data = json.loads(body)
+        return {"asn": data.get("asn"), "org": data.get("org"),
+                "country": data.get("country_name")}
     except Exception:
-        pass
-    return None
+        return None
+
+
+# ---------------------------------------------------------------------------
+# CORREÇÃO 2: checagem explícita de roteabilidade IPv6/Route64
+# ---------------------------------------------------------------------------
+def check_route64_reachability(host=ROUTE64_CHECK_HOST, port=ROUTE64_CHECK_PORT, timeout=6):
+    """Confirma que existe rota IPv6 USÁVEL (ex: via túnel Route64) abrindo
+    uma conexão TCP real — não apenas checando se a interface está 'up'."""
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+        s.close()
+        return True
+    except Exception as e:
+        print(f"[AVISO] IPv6 NÃO está roteável neste runner (Route64 down?): {e}",
+              file=sys.stderr)
+        return False
 
 
 def gather_source_info():
-    info = {"test_lane": TEST_LANE}
+    route64_ok = check_route64_reachability()
+    info = {"test_lane": TEST_LANE, "route64_ok": route64_ok}
+
     for family, key in ((socket.AF_INET, "ipv4"), (socket.AF_INET6, "ipv6")):
+        if key == "ipv6" and not route64_ok:
+            # não tenta nem descobrir IPv6 se já sabemos que não roteia —
+            # evita reintroduzir a confusão da v2
+            info[key] = {"ip": None, "ptr": None, "fcrdns": False, "asn_org": None}
+            continue
         ip = discover_source_ip(family)
         ptr = ptr_lookup(ip)
         fcrdns = fcrdns_check(ip, ptr)
@@ -154,11 +234,20 @@ def gather_source_info():
             "fcrdns": fcrdns,
             "asn_org": asn_org_lookup(ip),
         }
+
+    if info["ipv4"]["ip"] and info["ipv6"]["ip"] and info["ipv4"]["ip"] == info["ipv6"]["ip"]:
+        # não deveria mais acontecer, mas mantém a checagem como cinto de segurança
+        print("[ERRO] ipv4 e ipv6 retornaram o mesmo endereço — algo ainda está "
+              "caindo para IPv4 silenciosamente. Marcando ipv6 como inválido.",
+              file=sys.stderr)
+        info["ipv6"] = {"ip": None, "ptr": None, "fcrdns": False, "asn_org": None}
+        info["route64_ok"] = False
+
     return info
 
 
 # ---------------------------------------------------------------------------
-# Handshake SMTP fase a fase, com transcript completo
+# Handshake SMTP (igual à v2)
 # ---------------------------------------------------------------------------
 def read_response(sock, transcript):
     data = b""
@@ -190,13 +279,59 @@ def new_phase(name):
             "evidence": None}
 
 
+# ---------------------------------------------------------------------------
+# CORREÇÃO 3: conexão ao MX com tentativa real por endereço, não só DNS
+# ---------------------------------------------------------------------------
+def resolve_mx_candidates(mx_host, allow_ipv6):
+    """Retorna lista de (family_name, sockaddr_info) — IPv6 primeiro (só se
+    permitido), depois IPv4. Isso é só resolução DNS; a confirmação real
+    de que a rota funciona acontece na hora do connect(), não aqui."""
+    candidates = []
+    if allow_ipv6:
+        try:
+            for info in socket.getaddrinfo(mx_host, SMTP_PORT, socket.AF_INET6, socket.SOCK_STREAM):
+                candidates.append(("ipv6", info))
+        except Exception:
+            pass
+    try:
+        for info in socket.getaddrinfo(mx_host, SMTP_PORT, socket.AF_INET, socket.SOCK_STREAM):
+            candidates.append(("ipv4", info))
+    except Exception:
+        pass
+    return candidates
+
+
+def connect_to_mx(mx_host, source_info):
+    """Tenta conectar de verdade em cada endereço candidato, na ordem.
+    Retorna (sock, family_used, errors) — family_used reflete a conexão
+    que REALMENTE funcionou, não a que só existia no DNS."""
+    candidates = resolve_mx_candidates(mx_host, allow_ipv6=source_info.get("route64_ok", False))
+    errors = []
+    if not candidates:
+        return None, None, ["sem endereços resolvidos"]
+
+    for fam_name, (family, socktype, proto, canonname, sockaddr) in candidates:
+        try:
+            s = socket.socket(family, socktype, proto)
+            s.settimeout(TIMEOUT)
+            s.connect(sockaddr)
+            return s, fam_name, errors
+        except Exception as e:
+            errors.append(f"{fam_name} {sockaddr}: {e}")
+            continue
+
+    return None, None, errors
+
+
 def probe_domain(domain, source_info):
     result = {
         "domain": domain,
         "priority": domain in PRIORITY,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "test_lane": TEST_LANE,
+        "route64_ok": source_info.get("route64_ok", False),
         "source_ip_used": None,
+        "family_used": None,
         "mx": None,
         "phases": {
             "connect": new_phase("connect"),
@@ -229,41 +364,18 @@ def probe_domain(domain, source_info):
 
     mx_host = result["mx"]
 
-    # --- resolução do IP do MX (prefere IPv6, cai para IPv4) ---
-    family_used = None
-    try:
-        addr_info = socket.getaddrinfo(mx_host, SMTP_PORT, socket.AF_INET6)
-        family_used = "ipv6"
-    except Exception:
-        try:
-            addr_info = socket.getaddrinfo(mx_host, SMTP_PORT, socket.AF_INET)
-            family_used = "ipv4"
-        except Exception as e:
-            result["final_classification"] = "MX_UNRESOLVABLE"
-            result["notes"].append(str(e))
-            return result
+    # --- CONNECT (agora com tentativa real por endereço) ---
+    sock, family_used, connect_errors = connect_to_mx(mx_host, source_info)
+    if sock is None:
+        timed_out = any("timed out" in e or "timeout" in e.lower() for e in connect_errors)
+        phases["connect"].update(status="TIMEOUT" if timed_out else "REFUSED")
+        result["notes"].extend(connect_errors)
+        result["final_classification"] = "CONNECTIVITY_TIMEOUT" if timed_out else "CONNECTIVITY_REFUSED"
+        return result
 
+    result["family_used"] = family_used
     result["source_ip_used"] = source_info.get(family_used, {}).get("ip")
-
-    # --- CONNECT ---
-    try:
-        sock = socket.socket(addr_info[0][0], socket.SOCK_STREAM)
-        sock.settimeout(TIMEOUT)
-        sock.connect(addr_info[0][4])
-        phases["connect"]["status"] = "OK"
-    except socket.timeout:
-        phases["connect"].update(status="TIMEOUT")
-        result["final_classification"] = "CONNECTIVITY_TIMEOUT"
-        return result
-    except ConnectionRefusedError:
-        phases["connect"].update(status="REFUSED")
-        result["final_classification"] = "CONNECTIVITY_REFUSED"
-        return result
-    except Exception as e:
-        phases["connect"].update(status="ERROR")
-        result["notes"].append(str(e))
-        result["final_classification"] = "CONNECTIVITY_ERROR"
-        return result
+    phases["connect"]["status"] = "OK"
 
     try:
         # --- BANNER ---
@@ -351,9 +463,6 @@ def probe_domain(domain, source_info):
 
 
 def finalize(result):
-    """Decide a classificação final olhando a fase mais avançada com evidência,
-    dando prioridade a fases posteriores (mais informativas) e a evidência
-    textual sobre o código puro."""
     phases = result["phases"]
     order = ["rcpt_to", "mail_from", "ehlo_tls", "starttls", "ehlo", "banner"]
 
@@ -364,11 +473,10 @@ def finalize(result):
             result["final_confidence"] = p["confidence"]
             return result
 
-    # sem evidência textual — cai para o resultado bruto do RCPT
     rcpt = phases["rcpt_to"]
     if rcpt["status"] == "OK":
         result["final_classification"] = "ACCEPTED_TO_RCPT_STAGE"
-        result["final_confidence"] = 0.3  # RCPT é fictício, então "aceito" != confirmado
+        result["final_confidence"] = 0.3
     elif rcpt["status"] == "TEMP":
         result["final_classification"] = "TEMPORARY_NO_EVIDENCE"
         result["final_confidence"] = 0.4
@@ -386,9 +494,16 @@ def finalize(result):
 
 
 def main():
-    print(f"[INFO] Descobrindo IP/PTR/FCrDNS de saída (lane={TEST_LANE})...")
+    print(f"[INFO] Verificando roteabilidade IPv6 (Route64) e descobrindo IP/PTR de saída (lane={TEST_LANE})...")
     source_info = gather_source_info()
     print(json.dumps(source_info, indent=2, ensure_ascii=False))
+
+    if not source_info["route64_ok"]:
+        print("\n[ALERTA] Route64/IPv6 NÃO está roteável nesta execução. "
+              "Todos os testes vão rodar só por IPv4 e isso ficará marcado "
+              "em cada resultado (route64_ok=False). Corrija o túnel WireGuard "
+              "antes de tirar qualquer conclusão sobre comportamento por IPv6.\n",
+              file=sys.stderr)
 
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -397,7 +512,8 @@ def main():
             r = fut.result()
             results.append(r)
             print(f"[{i}/{len(PROVIDERS)}] {r['domain']:30s} -> "
-                  f"{r['final_classification']} ({r['final_confidence']:.2f})")
+                  f"{r['final_classification']} ({r['final_confidence']:.2f}) "
+                  f"[{r.get('family_used')}]")
 
     results.sort(key=lambda r: (not r["priority"], r["domain"]))
 
@@ -416,30 +532,40 @@ def main():
 
     with open("report.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["domain", "priority", "mx", "test_lane", "source_ip_used",
-                    "final_classification", "final_confidence",
+        w.writerow(["domain", "priority", "mx", "test_lane", "route64_ok", "family_used",
+                    "source_ip_used", "final_classification", "final_confidence",
                     "banner_code", "ehlo_code", "starttls_status",
                     "mail_from_code", "rcpt_code", "rcpt_evidence"])
         for r in results:
             p = r["phases"]
             w.writerow([
-                r["domain"], r["priority"], r["mx"], r["test_lane"], r["source_ip_used"],
+                r["domain"], r["priority"], r["mx"], r["test_lane"], r["route64_ok"],
+                r["family_used"], r["source_ip_used"],
                 r["final_classification"], f"{r['final_confidence']:.2f}",
                 p["banner"]["code"], p["ehlo"]["code"], p["starttls"]["status"],
                 p["mail_from"]["code"], p["rcpt_to"]["code"], p["rcpt_to"]["evidence"],
             ])
 
     with open("report.md", "w") as f:
-        f.write("# SMTP Diagnostic Engine — Relatório\n\n")
+        f.write("# SMTP Diagnostic Engine — Relatório (v3)\n\n")
         f.write(f"Run: {report['meta']['run']}  \n")
         f.write(f"Lane: **{TEST_LANE}**  \n")
+        f.write(f"Route64/IPv6 roteável nesta execução: **{'SIM' if source_info['route64_ok'] else 'NÃO'}**  \n")
         f.write(f"Total testado: {len(results)}\n\n")
 
         f.write("## IP de saída usado nesta execução\n\n")
         for fam in ("ipv4", "ipv6"):
             si = source_info.get(fam, {})
-            f.write(f"- **{fam}**: `{si.get('ip')}` — PTR: `{si.get('ptr')}` — "
+            f.write(f"- **{fam}**: `{si.get('ip') or 'NONE'}` — PTR: `{si.get('ptr') or 'NONE'}` — "
                     f"FCrDNS: {'PASS' if si.get('fcrdns') else 'FAIL'}\n")
+        f.write("\n")
+
+        family_counts = {}
+        for r in results:
+            family_counts[r.get("family_used")] = family_counts.get(r.get("family_used"), 0) + 1
+        f.write("## Família de IP realmente usada por domínio\n\n")
+        for k, v in sorted(family_counts.items(), key=lambda x: str(x[0])):
+            f.write(f"- **{k}**: {v}\n")
         f.write("\n")
 
         summary = {}
@@ -453,7 +579,7 @@ def main():
         for r in results:
             if not r["priority"]:
                 continue
-            f.write(f"### {r['domain']} (MX: {r['mx']})\n\n")
+            f.write(f"### {r['domain']} (MX: {r['mx']}, família: {r.get('family_used')})\n\n")
             f.write(f"Classificação final: **{r['final_classification']}** "
                     f"(confiança {r['final_confidence']:.2f})\n\n")
             for name, p in r["phases"].items():
