@@ -1,0 +1,81 @@
+name: PTR/SMTP Compatibility Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      setup_dns:
+        description: "Configurar SPF/DKIM/DMARC no deSEC antes do teste"
+        type: boolean
+        default: false
+
+jobs:
+  ptr-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências Python
+        run: pip install -r requirements.txt
+
+      - name: Configurar DNS (SPF/DKIM/DMARC) no deSEC
+        if: ${{ inputs.setup_dns }}
+        env:
+          DESEC_TOKEN: ${{ secrets.DESEC_TOKEN }}
+          TEST_DOMAIN: veriscop.dedyn.io
+          ROUTE64_IPV6_PREFIX: "2a11:6c7:f35:e3::/64"
+        run: python dns_setup.py
+
+      - name: Instalar WireGuard
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y wireguard-tools
+
+      - name: Subir túnel WireGuard (Route64)
+        env:
+          WG_PRIVATE_KEY: ${{ secrets.WG_PRIVATE_KEY }}
+          WG_PEER_PUBKEY: ${{ secrets.WG_PEER_PUBKEY }}
+          WG_ENDPOINT: ${{ secrets.WG_ENDPOINT }}
+          WG_ADDRESS: ${{ secrets.WG_ADDRESS }}
+        run: |
+          sudo mkdir -p /etc/wireguard
+          cat <<EOF | sudo tee /etc/wireguard/wg0.conf
+          [Interface]
+          PrivateKey = ${WG_PRIVATE_KEY}
+          Address = ${WG_ADDRESS}
+
+          [Peer]
+          PublicKey = ${WG_PEER_PUBKEY}
+          AllowedIPs = ::/1, 8000::/1
+          Endpoint = ${WG_ENDPOINT}
+          PersistentKeepalive = 15
+          EOF
+          sudo chmod 600 /etc/wireguard/wg0.conf
+          sudo wg-quick up wg0
+          sleep 3
+          ping6 -c 3 2a11:6c7:f35:e3::1 || echo "AVISO: ping falhou, mas seguindo"
+
+      - name: Rodar teste SMTP nos 370+ domínios
+        run: python smtp_probe.py
+
+      - name: Derrubar túnel
+        if: always()
+        run: sudo wg-quick down wg0 || true
+
+      - name: Upload do relatório
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ptr-smtp-report-${{ github.run_id }}
+          path: |
+            report.json
+            report.csv
+            report.md
+          retention-days: 30
