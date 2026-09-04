@@ -23,22 +23,42 @@ HEADERS = {
 
 
 def get_rrset(subname, rtype):
+    url_subname = "@" if subname == "" else subname
     r = requests.get(
-        f"{API}/domains/{DOMAIN}/rrsets/{subname}/{rtype}/", headers=HEADERS
+        f"{API}/domains/{DOMAIN}/rrsets/{url_subname}/{rtype}/",
+        headers=HEADERS,
     )
     if r.status_code == 200:
         return r.json()
-    return None
+    if r.status_code == 404:
+        return None
+    print(
+        f"[ERRO] GET {rtype} {subname or '@'}: "
+        f"{r.status_code} {r.text}",
+        file=sys.stderr,
+    )
+    r.raise_for_status()
 
 
 def put_rrset(subname, rtype, records, ttl=3600):
+    url_subname = "@" if subname == "" else subname
+    payload = {
+        "subname": subname,
+        "type": rtype,
+        "ttl": ttl,
+        "records": records,
+    }
     r = requests.put(
-        f"{API}/domains/{DOMAIN}/rrsets/{subname}/{rtype}/",
+        f"{API}/domains/{DOMAIN}/rrsets/{url_subname}/{rtype}/",
         headers=HEADERS,
-        json={"records": records, "ttl": ttl},
+        json=payload,
     )
     if r.status_code not in (200, 201):
-        print(f"[ERRO] {rtype} {subname}: {r.status_code} {r.text}", file=sys.stderr)
+        print(
+            f"[ERRO] {rtype} {subname or '@'}: "
+            f"{r.status_code} {r.text}",
+            file=sys.stderr,
+        )
         r.raise_for_status()
     print(f"[OK] {rtype} {subname or '@'} -> {records}")
 
