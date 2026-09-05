@@ -1,140 +1,51 @@
-name: PTR/SMTP Compatibility Test
+name: PTR/SMTP Compatibility Test (DEBUG - chaves diretas)
 
 on:
   workflow_dispatch:
-    inputs:
-      setup_dns:
-        description: "Configurar SPF/DKIM/DMARC no deSEC antes do teste"
-        type: boolean
-        default: false
-      allow_ipv4_fallback:
-        description: "Continuar o teste mesmo se o túnel IPv6 falhar (não recomendado)"
-        type: boolean
-        default: false
 
 jobs:
   ptr-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Instalar dependências Python
-        run: pip install -r requirements.txt
-
-      - name: Configurar DNS (SPF/DKIM/DMARC) no deSEC
-        if: ${{ inputs.setup_dns }}
-        env:
-          DESEC_TOKEN: ${{ secrets.DESEC_TOKEN }}
-          TEST_DOMAIN: veriscop.dedyn.io
-          ROUTE64_IPV6_PREFIX: "2a11:6c7:f35:e3::/64"
-        run: python dns_setup.py
-
       - name: Instalar ferramentas
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y wireguard-tools tcpdump conntrack dnsutils
 
-      - name: Verificar módulo de kernel WireGuard
+      - name: Confirmar integridade da chave (sem hardcode -- valor vem do secret)
         run: |
-          echo "### Verificando se o kernel tem suporte nativo a WireGuard ###"
-          if sudo modprobe wireguard 2>/tmp/modprobe_err; then
-            echo "OK: módulo wireguard carregado com sucesso"
-          else
-            echo "AVISO: modprobe falhou -- pode já estar embutido no kernel (comum em kernels 5.6+)"
-            cat /tmp/modprobe_err
-          fi
-          echo "--- lsmod ---"
-          lsmod | grep wireguard || echo "(não aparece em lsmod -- pode estar builtin, não é necessariamente erro)"
-          echo "--- versão do kernel ---"
-          uname -r
-
-      - name: Teste de round-trip UDP genérico (isolar causa -- Azure vs Route64)
-        run: |
-          echo "### Testando se ALGUM tráfego UDP volta para este runner ###"
-          echo "Isto usa um servidor STUN público (Google) só para saber se o Azure"
-          echo "bloqueia respostas UDP de forma geral, ou se o problema é específico do route64.org"
+          PRIV="0MYdgLXPDibSxROkmbx9CXoxOQBQD8TdZt4tv1yhZGE="
+          echo "Comprimento: $(echo -n "$PRIV" | wc -c) (esperado: 44)"
+          echo "Chave pública derivada desta privada:"
+          echo "$PRIV" | wg pubkey
           echo ""
-          cat > /tmp/stun_test.py <<'PYEOF'
-          import socket
-          s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-          s.settimeout(5)
-          try:
-              s.sendto(b'\x00\x01\x00\x00\x21\x12\xa4\x42' + b'\x00'*12, ('stun.l.google.com', 19302))
-              data, addr = s.recvfrom(1024)
-              print(f'RESULTADO: UDP genérico FUNCIONA -- recebi {len(data)} bytes de {addr}')
-              print('CONCLUSAO: Azure permite UDP inbound. Se o WireGuard falhar mesmo assim,')
-              print('o problema é específico do endpoint route64.org (propagação DNS, chave errada, etc), não bloqueio de rede.')
-          except socket.timeout:
-              print('RESULTADO: UDP genérico TAMBÉM falha -- nenhuma resposta do STUN')
-              print('CONCLUSAO: Muito provável que seja bloqueio geral de UDP inbound no runner do Azure.')
-              print('Neste caso o WireGuard nunca vai funcionar aqui dentro, independente da config.')
-          except Exception as e:
-              print(f'ERRO inesperado no teste STUN: {e}')
-          PYEOF
-          python3 /tmp/stun_test.py
+          echo "Compara a linha acima com o que está no painel route64.org"
+          echo "para o túnel tb35370. Se não bater, a chave nunca foi a certa."
 
-      - name: Registar o IP atual deste runner no route64.org (DynDNS2)
-        env:
-          ROUTE64_API_KEY: ${{ secrets.ROUTE64_API_KEY }}
-          ROUTE64_USERNAME: ${{ secrets.ROUTE64_USERNAME }}
-          ROUTE64_TUNNEL_ID: "35370"
-        run: |
-          MY_IP=$(curl -s https://api.ipify.org)
-          echo "IP público deste runner: $MY_IP"
-
-          RESPONSE=$(curl -s -u "${ROUTE64_USERNAME}:${ROUTE64_API_KEY}" \
-            "https://manager.route64.org/nic/update?hostname=${ROUTE64_TUNNEL_ID}&myip=${MY_IP}")
-          echo "Resposta do route64.org: $RESPONSE"
-
-          if [[ "$RESPONSE" == good* || "$RESPONSE" == nochg* ]]; then
-            echo "Endpoint registado/confirmado com sucesso."
-          else
-            echo "::error::Falha ao atualizar o endpoint no route64.org: '$RESPONSE'"
-            echo "Códigos possíveis: badauth (credenciais erradas), nohost (tunnel ID errado), badip (IP/família inválida), abuse (muito cedo -- só pode atualizar a cada ~10min), 911 (erro do servidor deles)."
-            exit 1
-          fi
-
-          echo "Aguardando propagação (45s, aumentado de 8s da run anterior)..."
-          sleep 45
-
-          echo "### Confirmando propagação real via consulta DNS externa ###"
-          dig +short A manager.route64.org || echo "(dig falhou, não bloqueante)"
-
-      - name: Subir túnel WireGuard (Route64) com captura detalhada
-        env:
-          WG_PRIVATE_KEY: ${{ secrets.WG_PRIVATE_KEY }}
-          WG_PEER_PUBKEY: ${{ secrets.WG_PEER_PUBKEY }}
-          WG_ENDPOINT: ${{ secrets.WG_ENDPOINT }}
-          WG_ADDRESS: ${{ secrets.WG_ADDRESS }}
+      - name: Subir túnel WireGuard (valores hardcoded, teste isolado)
         run: |
           sudo mkdir -p /etc/wireguard
-          cat <<EOF | sudo tee /etc/wireguard/wg0.conf
+          cat <<'EOF' | sudo tee /etc/wireguard/wg0.conf
           [Interface]
-          PrivateKey = ${WG_PRIVATE_KEY}
-          Address = ${WG_ADDRESS}
+          PrivateKey = 0MYdgLXPDibSxROkmbx9CXoxOQBQD8TdZt4tv1yhZGE=
+          Address = 2a11:6c7:f35:e3::2/64
 
           [Peer]
-          PublicKey = ${WG_PEER_PUBKEY}
+          PublicKey = 7bUaqpBf7vDYZovWepLoM+AN70MuKYH3IGPOyrdIgWA=
           AllowedIPs = ::/1, 8000::/1
-          Endpoint = ${WG_ENDPOINT}
+          Endpoint = 23.154.9.27:20119
           PersistentKeepalive = 15
           EOF
           sudo chmod 600 /etc/wireguard/wg0.conf
 
-          ENDPOINT_HOST=$(echo "${WG_ENDPOINT}" | cut -d: -f1)
-          ENDPOINT_PORT=$(echo "${WG_ENDPOINT}" | cut -d: -f2)
-          echo "Endpoint alvo: host=${ENDPOINT_HOST} porta=${ENDPOINT_PORT}"
+          echo "### Conteúdo do wg0.conf gerado (confirma visualmente) ###"
+          sudo cat /etc/wireguard/wg0.conf
 
-          echo "### Iniciando captura tcpdump em background (dura 25s) ###"
-          sudo tcpdump -ni any "udp and host ${ENDPOINT_HOST}" -w /tmp/wg_capture.pcap &
+          echo ""
+          echo "### Iniciando captura tcpdump ###"
+          sudo tcpdump -ni any "udp and host 23.154.9.27" -w /tmp/wg_capture.pcap &
           TCPDUMP_PID=$!
           sleep 1
 
@@ -163,61 +74,38 @@ jobs:
           sudo wg show wg0 dump
 
           echo ""
-          echo "### Captura tcpdump completa (pacotes UDP para/do endpoint) ###"
-          sudo tcpdump -r /tmp/wg_capture.pcap -nn -v 2>&1 || echo "(sem pacotes capturados)"
+          echo "### Captura tcpdump completa ###"
+          sudo tcpdump -r /tmp/wg_capture.pcap -nn -v 2>&1 || echo "(sem pacotes)"
 
           echo ""
-          echo "### Contagem de pacotes por direção ###"
-          echo "-- Saída (runner -> endpoint) --"
-          sudo tcpdump -r /tmp/wg_capture.pcap -nn "dst host ${ENDPOINT_HOST}" 2>/dev/null | wc -l
-          echo "-- Entrada (endpoint -> runner) --"
-          sudo tcpdump -r /tmp/wg_capture.pcap -nn "src host ${ENDPOINT_HOST}" 2>/dev/null | wc -l
+          echo "### Contagem por direção ###"
+          echo "-- Saída --"
+          sudo tcpdump -r /tmp/wg_capture.pcap -nn "dst host 23.154.9.27" 2>/dev/null | wc -l
+          echo "-- Entrada --"
+          sudo tcpdump -r /tmp/wg_capture.pcap -nn "src host 23.154.9.27" 2>/dev/null | wc -l
 
           echo ""
-          echo "### conntrack (prova em nível de kernel) ###"
-          sudo conntrack -L 2>/dev/null | grep "dst=${ENDPOINT_HOST}" || echo "(nenhuma entrada conntrack encontrada para este destino)"
-
-          echo ""
-          echo "### dmesg relacionado a wireguard/udp (últimas entradas) ###"
-          sudo dmesg | grep -iE "wireguard|udp" | tail -30 || echo "(nada relevante em dmesg)"
+          echo "### conntrack ###"
+          sudo conntrack -L 2>/dev/null | grep "dst=23.154.9.27" || echo "(nenhuma entrada)"
 
           if [ "$HANDSHAKE_OK" = "1" ]; then
-            echo ""
-            echo "### Testando ping via túnel ###"
-            ping6 -c 3 -W 3 2a11:6c7:f35:e3::1 || echo "AVISO: handshake ok mas ping falhou (pode ser ICMP bloqueado, não é necessariamente problema)"
-            echo "IPV6_TUNNEL_OK=true" >> "$GITHUB_ENV"
+            echo "RESULTADO: FUNCIONOU com chaves hardcoded -- o problema estava no GitHub Secret"
+            echo "(provavelmente espaço/quebra de linha ao colar o secret)."
           else
-            echo ""
-            echo "::error::Handshake não completou mesmo após registar o IP via DynDNS2 e esperar 45s."
-            echo "::error::Consulta os blocos acima: se 'Saída' > 0 e 'Entrada' = 0, o pacote sai mas nada volta"
-            echo "::error::(bloqueio de rede no caminho de volta, ou peer route64 não está a responder para este IP)."
-            echo "IPV6_TUNNEL_OK=false" >> "$GITHUB_ENV"
+            echo "RESULTADO: FALHOU mesmo com chaves hardcoded, idênticas ao painel."
+            echo "Isto elimina o secret como causa. O problema está do lado do route64.org"
+            echo "(chave pública não reconhecida, tunnel ID inativo, ou o servidor não está"
+            echo "a aceitar handshakes deste IP/ASN por algum motivo do lado deles)."
           fi
-
-      - name: Abortar se túnel IPv6 falhou (a menos que fallback seja permitido)
-        if: ${{ env.IPV6_TUNNEL_OK != 'true' && !inputs.allow_ipv4_fallback }}
-        run: |
-          echo "::error::Parando o job: túnel IPv6/Route64 não subiu e allow_ipv4_fallback está desativado."
-          echo "Rode de novo com 'allow_ipv4_fallback: true' se quiser mesmo assim testar só por IPv4."
-          exit 1
-
-      - name: Rodar teste SMTP nos domínios
-        env:
-          TEST_LANE: ${{ env.IPV6_TUNNEL_OK == 'true' && 'route64' || 'ipv4-fallback' }}
-        run: python smtp_probe.py
 
       - name: Derrubar túnel
         if: always()
         run: sudo wg-quick down wg0 || true
 
-      - name: Upload do relatório e captura de rede
+      - name: Upload da captura
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ptr-smtp-report-${{ github.run_id }}
-          path: |
-            report.json
-            report.csv
-            report.md
-            /tmp/wg_capture.pcap
-          retention-days: 30
+          name: wg-debug-capture
+          path: /tmp/wg_capture.pcap
+          retention-days: 5
