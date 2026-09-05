@@ -37,64 +37,42 @@ jobs:
           ROUTE64_IPV6_PREFIX: "2a11:6c7:f35:e3::/64"
         run: python dns_setup.py
 
-      - name: Instalar ferramentas de diagnóstico
+      - name: Instalar ferramentas
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y wireguard-tools tcpdump conntrack iproute2 dnsutils netcat-openbsd
+          sudo apt-get install -y wireguard-tools tcpdump conntrack dnsutils
 
-      - name: DIAGNÓSTICO COMPLETO — Túnel WireGuard (Route64)
+      - name: Registar o IP atual deste runner no route64.org (DynDNS2)
+        env:
+          ROUTE64_API_KEY: ${{ secrets.ROUTE64_API_KEY }}
+          ROUTE64_USERNAME: ${{ secrets.ROUTE64_USERNAME }}
+          ROUTE64_TUNNEL_ID: "35370"
+        run: |
+          MY_IP=$(curl -s https://api.ipify.org)
+          echo "IP público deste runner: $MY_IP"
+
+          RESPONSE=$(curl -s -u "${ROUTE64_USERNAME}:${ROUTE64_API_KEY}" \
+            "https://manager.route64.org/nic/update?hostname=${ROUTE64_TUNNEL_ID}&myip=${MY_IP}")
+          echo "Resposta do route64.org: $RESPONSE"
+
+          if [[ "$RESPONSE" == good* || "$RESPONSE" == nochg* ]]; then
+            echo "Endpoint registado/confirmado com sucesso."
+          else
+            echo "::error::Falha ao atualizar o endpoint no route64.org: '$RESPONSE'"
+            echo "Códigos possíveis: badauth (credenciais erradas), nohost (tunnel ID errado), badip (IP/família inválida), abuse (muito cedo -- só pode atualizar a cada ~10min), 911 (erro do servidor deles)."
+            exit 1
+          fi
+
+          echo "Aguardando propagação..."
+          sleep 8
+
+      - name: Subir túnel WireGuard (Route64)
         env:
           WG_PRIVATE_KEY: ${{ secrets.WG_PRIVATE_KEY }}
           WG_PEER_PUBKEY: ${{ secrets.WG_PEER_PUBKEY }}
           WG_ENDPOINT: ${{ secrets.WG_ENDPOINT }}
           WG_ADDRESS: ${{ secrets.WG_ADDRESS }}
         run: |
-          ENDPOINT_HOST=$(echo "$WG_ENDPOINT" | cut -d: -f1)
-          ENDPOINT_PORT=$(echo "$WG_ENDPOINT" | cut -d: -f2)
-          IFACE=$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}')
-
-          echo "=================================================================="
-          echo "PASSO 0 — Estado da rede ANTES de qualquer coisa"
-          echo "=================================================================="
-          echo "Interface física detectada: $IFACE"
-          echo "Meu IP público (v4): $(curl -s https://api.ipify.org)"
-          ip -6 addr show
-          echo ""
-          ip -6 route show
-          echo ""
-          echo "--- Regras de firewall locais (se houver) ---"
-          sudo iptables -L -n -v 2>/dev/null || echo "(sem iptables ou vazio)"
-          sudo ip6tables -L -n -v 2>/dev/null || echo "(sem ip6tables ou vazio)"
-
-          echo ""
-          echo "=================================================================="
-          echo "PASSO 1 — Baseline UDP (prova que UDP entrada/saída funciona)"
-          echo "=================================================================="
-          dig +time=3 +tries=1 @8.8.8.8 example.com || echo "!!! UDP baseline FALHOU — problema é mais amplo que o route64.org"
-
-          echo ""
-          echo "=================================================================="
-          echo "PASSO 2 — ICMP direto ao endpoint do route64.org"
-          echo "=================================================================="
-          ping -c 3 -W 3 "$ENDPOINT_HOST" || echo "ICMP para $ENDPOINT_HOST falhou"
-
-          echo ""
-          echo "=================================================================="
-          echo "PASSO 3 — Captura de pacotes brutos ligada ANTES do wg-quick up"
-          echo "=================================================================="
-          # Captura tudo de/para o endpoint, na interface física real (não no wg0,
-          # que ainda nem existe) -- isso é o que prova, byte a byte, o que
-          # realmente sai do runner e o que (não) volta.
-          sudo tcpdump -ni "$IFACE" -w /tmp/handshake_capture.pcap \
-            "host $ENDPOINT_HOST" &
-          TCPDUMP_PID=$!
-          sleep 1
-          echo "tcpdump rodando em background (PID $TCPDUMP_PID) na interface $IFACE"
-
-          echo ""
-          echo "=================================================================="
-          echo "PASSO 4 — Subir o túnel WireGuard"
-          echo "=================================================================="
           sudo mkdir -p /etc/wireguard
           cat <<EOF | sudo tee /etc/wireguard/wg0.conf
           [Interface]
@@ -110,77 +88,41 @@ jobs:
           sudo chmod 600 /etc/wireguard/wg0.conf
           sudo wg-quick up wg0
 
-          echo ""
-          echo "=================================================================="
-          echo "PASSO 5 — Monitorando handshake em tempo real (20s, a cada 2s)"
-          echo "=================================================================="
+          echo "### Aguardando handshake (até 20s) ###"
+          HANDSHAKE_OK=0
           for i in $(seq 1 10); do
             sleep 2
-            TS=$(date -u +%H:%M:%S)
             HS=$(sudo wg show wg0 latest-handshakes | awk '{print $2}')
             TRANSFER=$(sudo wg show wg0 transfer)
-            echo "[$TS] tentativa $i/10 -- handshake epoch: '${HS:-vazio}' -- transfer: ${TRANSFER:-vazio}"
+            echo "[tentativa $i/10] handshake epoch: '${HS:-vazio}' -- transfer: ${TRANSFER:-vazio}"
+            if [ -n "$HS" ] && [ "$HS" != "0" ]; then
+              echo ">>> Handshake confirmado (epoch $HS) <<<"
+              HANDSHAKE_OK=1
+              break
+            fi
           done
 
           echo ""
-          echo "=================================================================="
-          echo "PASSO 6 — Estado final detalhado do WireGuard"
-          echo "=================================================================="
+          echo "### wg show (estado final) ###"
           sudo wg show wg0 dump
-          echo ""
-          sudo wg showconf wg0
 
-          echo ""
-          echo "=================================================================="
-          echo "PASSO 7 — conntrack: existe algum fluxo UDP rastreado pro endpoint?"
-          echo "=================================================================="
-          sudo conntrack -L 2>/dev/null | grep -i "$ENDPOINT_HOST" || echo "Nenhuma entrada de conntrack encontrada para $ENDPOINT_HOST"
-
-          echo ""
-          echo "=================================================================="
-          echo "PASSO 8 — Teste de ping via túnel"
-          echo "=================================================================="
-          ping6 -c 5 -W 3 2a11:6c7:f35:e3::1 || echo "Ping via túnel falhou"
-
-          echo ""
-          echo "=================================================================="
-          echo "PASSO 9 — Parando a captura e resumindo os pacotes vistos"
-          echo "=================================================================="
-          sudo kill $TCPDUMP_PID 2>/dev/null || true
-          sleep 1
-          echo "--- Todos os pacotes capturados (saída E entrada, com tamanho exato) ---"
-          sudo tcpdump -nr /tmp/handshake_capture.pcap -v 2>/dev/null || echo "Nenhum pacote capturado no arquivo."
-
-          SENT=$(sudo tcpdump -nr /tmp/handshake_capture.pcap 2>/dev/null | grep -c "> ${ENDPOINT_HOST}" || echo 0)
-          RECV=$(sudo tcpdump -nr /tmp/handshake_capture.pcap 2>/dev/null | grep -c "${ENDPOINT_HOST}\." || echo 0)
-          echo ""
-          echo ">>> RESUMO FINAL <<<"
-          echo "Pacotes de SAÍDA capturados: $SENT"
-          echo "Pacotes de ENTRADA capturados: $RECV"
-
-          if [ "$RECV" = "0" ]; then
-            echo "IPV6_TUNNEL_OK=false" >> "$GITHUB_ENV"
-            echo "::error::Confirmado por captura de pacotes: ZERO bytes voltaram do endpoint $ENDPOINT_HOST:$ENDPOINT_PORT, mesmo com $SENT pacote(s) de saída confirmados. O arquivo .pcap será anexado ao artifact final para inspeção no Wireshark."
-          else
+          if [ "$HANDSHAKE_OK" = "1" ]; then
+            echo "### Testando ping via túnel ###"
+            ping6 -c 3 -W 3 2a11:6c7:f35:e3::1 || echo "AVISO: handshake ok mas ping falhou (pode ser ICMP bloqueado, não é necessariamente problema)"
             echo "IPV6_TUNNEL_OK=true" >> "$GITHUB_ENV"
+          else
+            echo "### Verificando conntrack (prova em nível de kernel) ###"
+            ENDPOINT_HOST=$(echo "$WG_ENDPOINT" | cut -d: -f1)
+            sudo conntrack -L 2>/dev/null | grep "dst=${ENDPOINT_HOST}" || echo "(nenhuma entrada conntrack encontrada)"
+            echo "::error::Handshake não completou mesmo após registar o IP via DynDNS2. Verifica a resposta do passo anterior (deveria ter sido 'good' ou 'nochg')."
+            echo "IPV6_TUNNEL_OK=false" >> "$GITHUB_ENV"
           fi
-
-          # Copia o pcap para o workspace pra poder subir como artifact depois
-          cp /tmp/handshake_capture.pcap "${GITHUB_WORKSPACE}/handshake_capture.pcap"
-
-      - name: Upload da captura de pacotes (.pcap) para inspeção no Wireshark
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: wireguard-handshake-pcap-${{ github.run_id }}
-          path: handshake_capture.pcap
-          retention-days: 14
 
       - name: Abortar se túnel IPv6 falhou (a menos que fallback seja permitido)
         if: ${{ env.IPV6_TUNNEL_OK != 'true' && !inputs.allow_ipv4_fallback }}
         run: |
           echo "::error::Parando o job: túnel IPv6/Route64 não subiu e allow_ipv4_fallback está desativado."
-          echo "Baixa o artifact 'wireguard-handshake-pcap-${{ github.run_id }}' e abre no Wireshark pra ver exatamente o que aconteceu byte a byte."
+          echo "Rode de novo com 'allow_ipv4_fallback: true' se quiser mesmo assim testar só por IPv4."
           exit 1
 
       - name: Rodar teste SMTP nos domínios
