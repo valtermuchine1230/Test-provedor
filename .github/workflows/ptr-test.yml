@@ -62,23 +62,24 @@ jobs:
           echo "Isto usa um servidor STUN público (Google) só para saber se o Azure"
           echo "bloqueia respostas UDP de forma geral, ou se o problema é específico do route64.org"
           echo ""
-          python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.settimeout(5)
-try:
-    s.sendto(b'\x00\x01\x00\x00\x21\x12\xa4\x42' + b'\x00'*12, ('stun.l.google.com', 19302))
-    data, addr = s.recvfrom(1024)
-    print(f'RESULTADO: UDP genérico FUNCIONA -- recebi {len(data)} bytes de {addr}')
-    print('CONCLUSAO: Azure permite UDP inbound. Se o WireGuard falhar mesmo assim,')
-    print('o problema é específico do endpoint route64.org (propagação DNS, chave errada, etc), não bloqueio de rede.')
-except socket.timeout:
-    print('RESULTADO: UDP genérico TAMBÉM falha -- nenhuma resposta do STUN')
-    print('CONCLUSAO: Muito provável que seja bloqueio geral de UDP inbound no runner do Azure.')
-    print('Neste caso o WireGuard nunca vai funcionar aqui dentro, independente da config.')
-except Exception as e:
-    print(f'ERRO inesperado no teste STUN: {e}')
-"
+          cat > /tmp/stun_test.py <<'PYEOF'
+          import socket
+          s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          s.settimeout(5)
+          try:
+              s.sendto(b'\x00\x01\x00\x00\x21\x12\xa4\x42' + b'\x00'*12, ('stun.l.google.com', 19302))
+              data, addr = s.recvfrom(1024)
+              print(f'RESULTADO: UDP genérico FUNCIONA -- recebi {len(data)} bytes de {addr}')
+              print('CONCLUSAO: Azure permite UDP inbound. Se o WireGuard falhar mesmo assim,')
+              print('o problema é específico do endpoint route64.org (propagação DNS, chave errada, etc), não bloqueio de rede.')
+          except socket.timeout:
+              print('RESULTADO: UDP genérico TAMBÉM falha -- nenhuma resposta do STUN')
+              print('CONCLUSAO: Muito provável que seja bloqueio geral de UDP inbound no runner do Azure.')
+              print('Neste caso o WireGuard nunca vai funcionar aqui dentro, independente da config.')
+          except Exception as e:
+              print(f'ERRO inesperado no teste STUN: {e}')
+          PYEOF
+          python3 /tmp/stun_test.py
 
       - name: Registar o IP atual deste runner no route64.org (DynDNS2)
         env:
