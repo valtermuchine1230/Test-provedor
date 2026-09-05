@@ -42,6 +42,44 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y wireguard-tools tcpdump conntrack dnsutils
 
+      - name: Verificar módulo de kernel WireGuard
+        run: |
+          echo "### Verificando se o kernel tem suporte nativo a WireGuard ###"
+          if sudo modprobe wireguard 2>/tmp/modprobe_err; then
+            echo "OK: módulo wireguard carregado com sucesso"
+          else
+            echo "AVISO: modprobe falhou -- pode já estar embutido no kernel (comum em kernels 5.6+)"
+            cat /tmp/modprobe_err
+          fi
+          echo "--- lsmod ---"
+          lsmod | grep wireguard || echo "(não aparece em lsmod -- pode estar builtin, não é necessariamente erro)"
+          echo "--- versão do kernel ---"
+          uname -r
+
+      - name: Teste de round-trip UDP genérico (isolar causa -- Azure vs Route64)
+        run: |
+          echo "### Testando se ALGUM tráfego UDP volta para este runner ###"
+          echo "Isto usa um servidor STUN público (Google) só para saber se o Azure"
+          echo "bloqueia respostas UDP de forma geral, ou se o problema é específico do route64.org"
+          echo ""
+          python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(5)
+try:
+    s.sendto(b'\x00\x01\x00\x00\x21\x12\xa4\x42' + b'\x00'*12, ('stun.l.google.com', 19302))
+    data, addr = s.recvfrom(1024)
+    print(f'RESULTADO: UDP genérico FUNCIONA -- recebi {len(data)} bytes de {addr}')
+    print('CONCLUSAO: Azure permite UDP inbound. Se o WireGuard falhar mesmo assim,')
+    print('o problema é específico do endpoint route64.org (propagação DNS, chave errada, etc), não bloqueio de rede.')
+except socket.timeout:
+    print('RESULTADO: UDP genérico TAMBÉM falha -- nenhuma resposta do STUN')
+    print('CONCLUSAO: Muito provável que seja bloqueio geral de UDP inbound no runner do Azure.')
+    print('Neste caso o WireGuard nunca vai funcionar aqui dentro, independente da config.')
+except Exception as e:
+    print(f'ERRO inesperado no teste STUN: {e}')
+"
+
       - name: Registar o IP atual deste runner no route64.org (DynDNS2)
         env:
           ROUTE64_API_KEY: ${{ secrets.ROUTE64_API_KEY }}
@@ -63,10 +101,13 @@ jobs:
             exit 1
           fi
 
-          echo "Aguardando propagação..."
-          sleep 8
+          echo "Aguardando propagação (45s, aumentado de 8s da run anterior)..."
+          sleep 45
 
-      - name: Subir túnel WireGuard (Route64)
+          echo "### Confirmando propagação real via consulta DNS externa ###"
+          dig +short A manager.route64.org || echo "(dig falhou, não bloqueante)"
+
+      - name: Subir túnel WireGuard (Route64) com captura detalhada
         env:
           WG_PRIVATE_KEY: ${{ secrets.WG_PRIVATE_KEY }}
           WG_PEER_PUBKEY: ${{ secrets.WG_PEER_PUBKEY }}
@@ -86,6 +127,16 @@ jobs:
           PersistentKeepalive = 15
           EOF
           sudo chmod 600 /etc/wireguard/wg0.conf
+
+          ENDPOINT_HOST=$(echo "${WG_ENDPOINT}" | cut -d: -f1)
+          ENDPOINT_PORT=$(echo "${WG_ENDPOINT}" | cut -d: -f2)
+          echo "Endpoint alvo: host=${ENDPOINT_HOST} porta=${ENDPOINT_PORT}"
+
+          echo "### Iniciando captura tcpdump em background (dura 25s) ###"
+          sudo tcpdump -ni any "udp and host ${ENDPOINT_HOST}" -w /tmp/wg_capture.pcap &
+          TCPDUMP_PID=$!
+          sleep 1
+
           sudo wg-quick up wg0
 
           echo "### Aguardando handshake (até 20s) ###"
@@ -102,19 +153,43 @@ jobs:
             fi
           done
 
+          sleep 3
+          sudo kill "$TCPDUMP_PID" 2>/dev/null || true
+          sleep 1
+
           echo ""
           echo "### wg show (estado final) ###"
           sudo wg show wg0 dump
 
+          echo ""
+          echo "### Captura tcpdump completa (pacotes UDP para/do endpoint) ###"
+          sudo tcpdump -r /tmp/wg_capture.pcap -nn -v 2>&1 || echo "(sem pacotes capturados)"
+
+          echo ""
+          echo "### Contagem de pacotes por direção ###"
+          echo "-- Saída (runner -> endpoint) --"
+          sudo tcpdump -r /tmp/wg_capture.pcap -nn "dst host ${ENDPOINT_HOST}" 2>/dev/null | wc -l
+          echo "-- Entrada (endpoint -> runner) --"
+          sudo tcpdump -r /tmp/wg_capture.pcap -nn "src host ${ENDPOINT_HOST}" 2>/dev/null | wc -l
+
+          echo ""
+          echo "### conntrack (prova em nível de kernel) ###"
+          sudo conntrack -L 2>/dev/null | grep "dst=${ENDPOINT_HOST}" || echo "(nenhuma entrada conntrack encontrada para este destino)"
+
+          echo ""
+          echo "### dmesg relacionado a wireguard/udp (últimas entradas) ###"
+          sudo dmesg | grep -iE "wireguard|udp" | tail -30 || echo "(nada relevante em dmesg)"
+
           if [ "$HANDSHAKE_OK" = "1" ]; then
+            echo ""
             echo "### Testando ping via túnel ###"
             ping6 -c 3 -W 3 2a11:6c7:f35:e3::1 || echo "AVISO: handshake ok mas ping falhou (pode ser ICMP bloqueado, não é necessariamente problema)"
             echo "IPV6_TUNNEL_OK=true" >> "$GITHUB_ENV"
           else
-            echo "### Verificando conntrack (prova em nível de kernel) ###"
-            ENDPOINT_HOST=$(echo "$WG_ENDPOINT" | cut -d: -f1)
-            sudo conntrack -L 2>/dev/null | grep "dst=${ENDPOINT_HOST}" || echo "(nenhuma entrada conntrack encontrada)"
-            echo "::error::Handshake não completou mesmo após registar o IP via DynDNS2. Verifica a resposta do passo anterior (deveria ter sido 'good' ou 'nochg')."
+            echo ""
+            echo "::error::Handshake não completou mesmo após registar o IP via DynDNS2 e esperar 45s."
+            echo "::error::Consulta os blocos acima: se 'Saída' > 0 e 'Entrada' = 0, o pacote sai mas nada volta"
+            echo "::error::(bloqueio de rede no caminho de volta, ou peer route64 não está a responder para este IP)."
             echo "IPV6_TUNNEL_OK=false" >> "$GITHUB_ENV"
           fi
 
@@ -134,7 +209,7 @@ jobs:
         if: always()
         run: sudo wg-quick down wg0 || true
 
-      - name: Upload do relatório
+      - name: Upload do relatório e captura de rede
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -143,4 +218,5 @@ jobs:
             report.json
             report.csv
             report.md
+            /tmp/wg_capture.pcap
           retention-days: 30
